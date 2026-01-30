@@ -17,6 +17,8 @@ import codecs
 import hashlib
 from transformers import AutoTokenizer
 import requests
+from pathlib import Path
+from transformers import AutoTokenizer
 
 # Build number is now imported from __init__.py
 from . import __version__
@@ -46,7 +48,7 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def get_tokenizer(model_name, tokenizer_name=None):
+def get_tokenizerv1(model_name, tokenizer_name=None):
     try:
         name = tokenizer_name if tokenizer_name else model_name
         return AutoTokenizer.from_pretrained(name)
@@ -55,6 +57,33 @@ def get_tokenizer(model_name, tokenizer_name=None):
         print("Falling back to 'gpt2' tokenizer as approximation.")
         return AutoTokenizer.from_pretrained("gpt2")
 
+def get_tokenizer2(model_name, tokenizer_path=None):
+    print(f"DEBUG: model_name={model_name}")
+    print(f"DEBUG: tokenizer_path={tokenizer_path}")
+    if tokenizer_path:
+        path = Path(tokenizer_path)
+        if path.exists():
+            print(f"DEBUG: Loading tokenizer from local path: {path}")
+            return AutoTokenizer.from_pretrained(
+                path,
+                local_files_only=True,
+                use_fast=False,
+                repo_type="tokenizer"
+            )
+        else:
+            print(f"DEBUG: Path does not exist: {path}")
+    print("DEBUG: Falling back to model_name")
+    return AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=False)
+
+class DummyTokenizer:
+    def encode(self, text, **kwargs):
+        return text.split()
+
+    def decode(self, tokens, **kwargs):
+        return " ".join(tokens)
+
+def get_tokenizer(model_name, tokenizer_path=None):
+    return DummyTokenizer()
 
 def prepare_text_data(book_url, tokenizer):
     try:
