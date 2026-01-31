@@ -23,6 +23,34 @@ from pathlib import Path
 # Build number is now imported from __init__.py
 from . import __version__
 
+# Constants for magic numbers
+TOKEN_USAGE_TOLERANCE = 0.2  # 20% tolerance for token usage differences
+MINIMUM_TIME_MS = 0.001  # 1ms minimum time for speed calculations
+
+# Default configuration values
+DEFAULT_PROMPT_TOKENS = 2048  # Default prompt processing token count
+DEFAULT_GENERATION_TOKENS = 32  # Default token generation count
+DEFAULT_DEPTH = 0  # Default context depth
+DEFAULT_RUNS = 3  # Default number of runs per test
+DEFAULT_MAX_TOKENS = 1  # Default max tokens for API requests
+DEFAULT_WARMUP_REPEATS = 10  # Number of times to repeat warmup text
+DEFAULT_TIMEOUT_SECONDS = 3600  # Default timeout for HTTP requests
+DEFAULT_KEEPALIVE_TIMEOUT = 600  # Default keepalive timeout for connections
+DEFAULT_DEBUG_OUTPUT_LIMIT = 100  # Character limit for debug output
+
+# Array and calculation constants
+TOKEN_BUFFER_MULTIPLIER = 2  # Buffer multiplier for token array allocation
+MINIMUM_TOKEN_COUNT = 1  # Minimum token count for calculations
+ZERO_VALUE = 0  # Zero value for calculations
+
+# HTTP/API constants
+HTTP_SUCCESS_STATUS = 200  # HTTP success status code
+LATENCY_MEASUREMENT_ITERATIONS = 3  # Number of iterations for latency measurement
+
+# Time and formatting constants
+MILLISECONDS_MULTIPLIER = 1000  # Multiplier for converting seconds to milliseconds
+FORMAT_RESULT_MULTIPLIER = 1.0  # Default multiplier for result formatting
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="LLM Benchmark Script")
@@ -35,10 +63,10 @@ def parse_arguments():
                        help="Load tokenizer from HuggingFace Hub (e.g., 'gpt2', 'bert-base-uncased')")
     parser.add_argument("--tokenizer-path", type=str, default=None,
                        help="Load tokenizer from local path (directory or file)")
-    parser.add_argument("--pp", type=int, nargs='+', required=False, default=[2048], help="List of prompt processing token counts - default: 2048")
-    parser.add_argument("--tg", type=int, nargs='+', required=False, default=[32], help="List of token generation counts - default: 32")
-    parser.add_argument("--depth", type=int, nargs='+', default=[0], help="List of context depths (previous conversation tokens) - default: 0")
-    parser.add_argument("--runs", type=int, default=3, help="Number of runs per test - default: 3")
+    parser.add_argument("--pp", type=int, nargs='+', required=False, default=[DEFAULT_PROMPT_TOKENS], help="List of prompt processing token counts - default: 2048")
+    parser.add_argument("--tg", type=int, nargs='+', required=False, default=[DEFAULT_GENERATION_TOKENS], help="List of token generation counts - default: 32")
+    parser.add_argument("--depth", type=int, nargs='+', default=[DEFAULT_DEPTH], help="List of context depths (previous conversation tokens) - default: 0")
+    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS, help="Number of runs per test - default: 3")
     parser.add_argument("--no-cache", action="store_true", help="Ensure unique requests to avoid prefix caching and send cache_prompt=false to the server")
     parser.add_argument("--post-run-cmd", type=str, default=None, help="Command to execute after each test run")
     parser.add_argument("--book-url", type=str, default="https://www.gutenberg.org/files/1661/1661-0.txt", help="URL of a book to use for text generation, defaults to Sherlock Holmes (https://www.gutenberg.org/files/1661/1661-0.txt)")
@@ -150,7 +178,7 @@ def generate_prompt(all_tokens, tokenizer, prompt_tokens, context_tokens=0, no_c
     
     if len(all_tokens) < total_needed:
         # Repeat tokens if not enough
-        all_tokens = all_tokens * (total_needed // len(all_tokens) + 2)
+        all_tokens = all_tokens * (total_needed // len(all_tokens) + TOKEN_BUFFER_MULTIPLIER)
     
     # Pick a random start position
     max_start = len(all_tokens) - total_needed
@@ -176,7 +204,7 @@ async def measure_latency(session, base_url, api_key, mode="api", model_name=Non
     latencies = []
     headers = {"Authorization": f"Bearer {api_key}"}
     
-    for _ in range(3):
+    for _ in range(LATENCY_MEASUREMENT_ITERATIONS):
         start = time.perf_counter()
         try:
             if mode == "api":
@@ -212,7 +240,7 @@ async def measure_latency(session, base_url, api_key, mode="api", model_name=Non
 async def warmup(session, base_url, api_key, model, tokenizer=None):
     print("Warming up...")
     headers = {"Authorization": f"Bearer {api_key}"}
-    warmup_text = "Warmup " * 10
+    warmup_text = "Warmup " * DEFAULT_WARMUP_REPEATS
     
     delta_user = 0
     delta_context = 0
@@ -221,7 +249,7 @@ async def warmup(session, base_url, api_key, model, tokenizer=None):
     payload_user = {
         "model": model,
         "messages": [{"role": "user", "content": warmup_text}],
-        "max_tokens": 1
+        "max_tokens": DEFAULT_MAX_TOKENS
     }
     
     try:
@@ -246,7 +274,7 @@ async def warmup(session, base_url, api_key, model, tokenizer=None):
                     {"role": "system", "content": warmup_text},
                     {"role": "user", "content": ""}
                 ],
-                "max_tokens": 1
+                "max_tokens": DEFAULT_MAX_TOKENS
             }
             async with session.post(f"{base_url}/chat/completions", json=payload_sys_empty, headers=headers) as response:
                 response_json = await response.json()
@@ -394,8 +422,8 @@ async def parse_streaming_response(response_stream, tokenizer, args):
     end_time = time.perf_counter()
     if args.debug_info:
         print(f"DEBUG: Final token_count: {token_count}, end_time: {end_time:.3f}s")
-        print(f"DEBUG: Accumulated content: {repr(accumulated_content[:100] if accumulated_content else None)}...")
-        print(f"DEBUG: Accumulated reasoning_content: {repr(accumulated_reasoning_content[:100] if accumulated_reasoning_content else None)}...")
+        print(f"DEBUG: Accumulated content: {repr(accumulated_content[:DEFAULT_DEBUG_OUTPUT_LIMIT] if accumulated_content else None)}...")
+        print(f"DEBUG: Accumulated reasoning_content: {repr(accumulated_reasoning_content[:DEFAULT_DEBUG_OUTPUT_LIMIT] if accumulated_reasoning_content else None)}...")
     
     return accumulated_content, accumulated_reasoning_content, token_count, prompt_usage_tokens, first_token_time, has_first_token_been_tracked
 
@@ -429,10 +457,10 @@ def calculate_performance_metrics(start_time, first_token_time, end_time, token_
     
     if token_count > 0:
         # Calculate TTFT and E2E TTFT
-        e2e_ttft = first_token_time - start_time if first_token_time > 0 else 0
-        ttft = e2e_ttft - latency if e2e_ttft > 0 else 0
-        if ttft < 0:
-            ttft = 0
+        e2e_ttft = first_token_time - start_time if first_token_time > ZERO_VALUE else ZERO_VALUE
+        ttft = e2e_ttft - latency if e2e_ttft > ZERO_VALUE else ZERO_VALUE
+        if ttft < ZERO_VALUE:
+            ttft = ZERO_VALUE
             
         # Calculate token generation speed (for streaming mode)
         if first_token_time > 0 and end_time > first_token_time:
@@ -440,17 +468,17 @@ def calculate_performance_metrics(start_time, first_token_time, end_time, token_
             generation_time = end_time - first_token_time
             if generation_time > 0:
                 # Speed for generated tokens (excluding the first one which is TTFT)
-                result["tg_speed"] = (token_count - 1) / generation_time if token_count > 1 else token_count / generation_time
+                result["tg_speed"] = (token_count - MINIMUM_TOKEN_COUNT) / generation_time if token_count > MINIMUM_TOKEN_COUNT else token_count / generation_time
             else:
                 # Fallback if generation time is too small
-                result["tg_speed"] = (token_count - 1) / 0.001 if token_count > 1 else token_count / 0.001
+                result["tg_speed"] = (token_count - 1) / MINIMUM_TIME_MS if token_count > 1 else token_count / MINIMUM_TIME_MS
         else:
             # Fallback for non-streaming or edge cases
             total_request_time = end_time - start_time
             if total_request_time > 0:
                 result["tg_speed"] = token_count / total_request_time
             else:
-                result["tg_speed"] = token_count / 0.001  # Assume 1ms minimum
+                result["tg_speed"] = token_count / MINIMUM_TIME_MS  # Assume 1ms minimum
         
         # Use expected_pp_tokens for speed calculation
         total_prompt_tokens = expected_pp_tokens
@@ -459,17 +487,17 @@ def calculate_performance_metrics(start_time, first_token_time, end_time, token_
         # but not if it's vastly different (which happens in prefix caching where usage includes cached tokens)
         if prompt_usage_tokens > 0:
             diff = abs(prompt_usage_tokens - expected_pp_tokens)
-            if diff < expected_pp_tokens * 0.2: # 20% tolerance
+            if diff < expected_pp_tokens * TOKEN_USAGE_TOLERANCE:  # 20% tolerance
                  total_prompt_tokens = prompt_usage_tokens
 
         # Calculate TTFT (time to first token) and Estimated Prompt Processing Time
-        ttfr = 0
-        est_ppt = 0
-        if first_token_time > 0:
+        ttfr = ZERO_VALUE
+        est_ppt = ZERO_VALUE
+        if first_token_time > ZERO_VALUE:
             ttfr = first_token_time - start_time
             est_ppt = ttfr - latency
-            if est_ppt < 0:
-                est_ppt = 0
+            if est_ppt < ZERO_VALUE:
+                est_ppt = ZERO_VALUE
 
         if est_ppt > 0:
             result["pp_speed"] = total_prompt_tokens / est_ppt
@@ -582,7 +610,7 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
         start_time = time.perf_counter()
 
         async with session.post(f"{base_url}/chat/completions", json=payload, headers=headers) as response:
-            if response.status != 200:
+            if response.status != HTTP_SUCCESS_STATUS:
                 error_text = await response.text()
                 print(f"Error: {response.status} - {error_text}")
                 return None
@@ -637,8 +665,8 @@ async def main_async():
     print(f"Total tokens available in text corpus: {len(all_tokens)}")
     
     # Use a large timeout for long-running benchmarks
-    timeout = aiohttp.ClientTimeout(total=3600)
-    connector = aiohttp.TCPConnector(limit=1, force_close=False, keepalive_timeout=600)
+    timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT_SECONDS)
+    connector = aiohttp.TCPConnector(limit=1, force_close=False, keepalive_timeout=DEFAULT_KEEPALIVE_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=True) as session:
         delta_user = 0
         delta_context = 0
@@ -728,7 +756,7 @@ async def main_async():
                                 e2e_ttft_values.append(run_result["e2e_ttft"])
 
                     # Aggregate results
-                    def format_result(values, multiplier=1.0):
+                    def format_result(values, multiplier=FORMAT_RESULT_MULTIPLIER):
                         if not values: return ""
                         mean = np.mean(values) * multiplier
                         std = np.std(values) * multiplier
@@ -741,9 +769,9 @@ async def main_async():
                             args.model, 
                             test_name, 
                             format_result(ctx_pp_speeds), 
-                            format_result(ctx_ttfr_values, 1000), 
-                            format_result(ctx_est_ppt_values, 1000), 
-                            format_result(ctx_e2e_ttft_values, 1000)
+                            format_result(ctx_ttfr_values, MILLISECONDS_MULTIPLIER),
+                            format_result(ctx_est_ppt_values, MILLISECONDS_MULTIPLIER),
+                            format_result(ctx_e2e_ttft_values, MILLISECONDS_MULTIPLIER)
                         ])
 
                     # Context TG (if enabled)
@@ -759,9 +787,9 @@ async def main_async():
                             args.model, 
                             test_name, 
                             format_result(pp_speeds), 
-                            format_result(ttfr_values, 1000), 
-                            format_result(est_ppt_values, 1000), 
-                            format_result(e2e_ttft_values, 1000)
+                            format_result(ttfr_values, MILLISECONDS_MULTIPLIER),
+                            format_result(est_ppt_values, MILLISECONDS_MULTIPLIER),
+                            format_result(e2e_ttft_values, MILLISECONDS_MULTIPLIER)
                         ])
                     
                     # Standard TG
