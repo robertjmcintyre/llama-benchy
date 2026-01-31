@@ -310,19 +310,263 @@ def track_token_metrics(chunk: str, tokenizer, first_token_time: float,
     return chunk_tokens, first_token_time, has_first_token_tracked
 
 
+async def parse_streaming_response(response_stream, tokenizer, args):
+    """
+    Parse streaming response and extract content/usage data.
+    
+    Args:
+        response_stream: The streaming response object from aiohttp
+        tokenizer: Tokenizer instance for token counting
+        args: Arguments object containing debug_info flag
+        
+    Returns:
+        tuple: (accumulated_content, accumulated_reasoning_content, token_count,
+                prompt_usage_tokens, first_token_time, has_first_token_been_tracked)
+    """
+    accumulated_content = ""
+    accumulated_reasoning_content = ""
+    token_count = 0
+    prompt_usage_tokens = 0
+    first_token_time = 0
+    has_first_token_been_tracked = False
+    first_response_time = 0
+    end_time = 0
+    
+    async for line in response_stream:
+        line = line.decode('utf-8').strip()
+        if not line:
+            continue
+            
+        if line.startswith('data: '):
+            data_str = line[6:]  # Remove 'data: ' prefix
+            if data_str.strip() == '[DONE]':
+                break
+                
+            try:
+                data = json.loads(data_str)
+                
+                # Track first response time
+                if first_response_time == 0:
+                    first_response_time = time.perf_counter()
+                    if args.debug_info:
+                        print(f"DEBUG: First response received at {first_response_time:.3f}s")
+                
+                # Extract content
+                if 'choices' in data and len(data['choices']) > 0:
+                    choice = data['choices'][0]
+                    
+                    # Handle regular content
+                    if 'delta' in choice and 'content' in choice['delta']:
+                        content_chunk = choice['delta']['content']
+                        if content_chunk:
+                            accumulated_content += content_chunk
+                            
+                            # Use helper function to track token metrics
+                            chunk_tokens, first_token_time, has_first_token_been_tracked = track_token_metrics(
+                                content_chunk, tokenizer, first_token_time, has_first_token_been_tracked, args.debug_info
+                            )
+                            token_count += chunk_tokens
+                    
+                    # Handle reasoning content
+                    if 'delta' in choice and 'reasoning_content' in choice['delta']:
+                        reasoning_chunk = choice['delta']['reasoning_content']
+                        if reasoning_chunk:
+                            accumulated_reasoning_content += reasoning_chunk
+                            
+                            # Use helper function to track token metrics
+                            chunk_tokens, first_token_time, has_first_token_been_tracked = track_token_metrics(
+                                reasoning_chunk, tokenizer, first_token_time, has_first_token_been_tracked, args.debug_info
+                            )
+                            token_count += chunk_tokens
+                    
+                    # Extract usage information if present in this chunk
+                    if 'usage' in data:
+                        usage_data = data['usage']
+                        if 'prompt_tokens' in usage_data:
+                            prompt_usage_tokens = usage_data['prompt_tokens']
+                        
+            except json.JSONDecodeError as e:
+                if args.debug_info:
+                    print(f"DEBUG: JSON decode error in streaming: {e}")
+                    print(f"DEBUG: Line content: {repr(line)}")
+                continue
+                
+    end_time = time.perf_counter()
+    if args.debug_info:
+        print(f"DEBUG: Final token_count: {token_count}, end_time: {end_time:.3f}s")
+        print(f"DEBUG: Accumulated content: {repr(accumulated_content[:100] if accumulated_content else None)}...")
+        print(f"DEBUG: Accumulated reasoning_content: {repr(accumulated_reasoning_content[:100] if accumulated_reasoning_content else None)}...")
+    
+    return accumulated_content, accumulated_reasoning_content, token_count, prompt_usage_tokens, first_token_time, has_first_token_been_tracked
+
+
+def calculate_performance_metrics(start_time, first_token_time, end_time, token_count,
+                                  prompt_usage_tokens, expected_pp_tokens, latency, args):
+    """
+    Calculate all performance metrics from timing and token data.
+    
+    Args:
+        start_time: When the request started
+        first_token_time: When the first token was received
+        end_time: When the request ended
+        token_count: Total tokens generated
+        prompt_usage_tokens: Actual prompt tokens used (from API)
+        expected_pp_tokens: Expected prompt tokens
+        latency: Measured latency
+        args: Arguments object containing debug_info flag
+        
+    Returns:
+        dict: Dictionary of calculated performance metrics
+    """
+    result = {
+        "pp_speed": None,
+        "tg_speed": None,
+        "ttft": None,
+        "ttfr": None,
+        "est_ppt": None,
+        "e2e_ttft": None
+    }
+    
+    if token_count > 0:
+        # Calculate TTFT and E2E TTFT
+        e2e_ttft = first_token_time - start_time if first_token_time > 0 else 0
+        ttft = e2e_ttft - latency if e2e_ttft > 0 else 0
+        if ttft < 0:
+            ttft = 0
+            
+        # Calculate token generation speed (for streaming mode)
+        if first_token_time > 0 and end_time > first_token_time:
+            # Generation time = total time - first token time
+            generation_time = end_time - first_token_time
+            if generation_time > 0:
+                # Speed for generated tokens (excluding the first one which is TTFT)
+                result["tg_speed"] = (token_count - 1) / generation_time if token_count > 1 else token_count / generation_time
+            else:
+                # Fallback if generation time is too small
+                result["tg_speed"] = (token_count - 1) / 0.001 if token_count > 1 else token_count / 0.001
+        else:
+            # Fallback for non-streaming or edge cases
+            total_request_time = end_time - start_time
+            if total_request_time > 0:
+                result["tg_speed"] = token_count / total_request_time
+            else:
+                result["tg_speed"] = token_count / 0.001  # Assume 1ms minimum
+        
+        # Use expected_pp_tokens for speed calculation
+        total_prompt_tokens = expected_pp_tokens
+        
+        # Only use reported usage if it's close to expected (to handle tokenizer differences)
+        # but not if it's vastly different (which happens in prefix caching where usage includes cached tokens)
+        if prompt_usage_tokens > 0:
+            diff = abs(prompt_usage_tokens - expected_pp_tokens)
+            if diff < expected_pp_tokens * 0.2: # 20% tolerance
+                 total_prompt_tokens = prompt_usage_tokens
+
+        # Calculate TTFT (time to first token) and Estimated Prompt Processing Time
+        ttfr = 0
+        est_ppt = 0
+        if first_token_time > 0:
+            ttfr = first_token_time - start_time
+            est_ppt = ttfr - latency
+            if est_ppt < 0:
+                est_ppt = 0
+
+        if est_ppt > 0:
+            result["pp_speed"] = total_prompt_tokens / est_ppt
+            result["est_ppt"] = est_ppt
+
+        if ttfr > 0:
+            result["ttfr"] = ttfr
+
+        if ttft > 0:
+            result["ttft"] = ttft
+
+        if e2e_ttft > 0:
+            result["e2e_ttft"] = e2e_ttft
+    
+    return result
+
+
+def execute_post_run_command(post_run_cmd):
+    """
+    Safely execute post-run command.
+    
+    Args:
+        post_run_cmd: Command string to execute after benchmark run
+        
+    Returns:
+        None (executes command and handles errors)
+    """
+    if post_run_cmd:
+        try:
+            # Fix: Avoid shell=True to prevent command injection
+            subprocess.run(post_run_cmd.split(), check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Post-run command failed: {e}")
+
+
+def setup_benchmark_payload(model_name, messages, max_tokens, no_cache, api_key):
+    """
+    Prepare benchmark request payload and headers.
+    
+    Args:
+        model_name: Name of the model to benchmark
+        messages: List of message dictionaries for the chat
+        max_tokens: Maximum number of tokens to generate
+        no_cache: Boolean indicating whether to disable caching
+        api_key: API key for authentication
+        
+    Returns:
+        tuple: (payload_dict, headers_dict)
+    """
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": True,  # Enable streaming for accurate token generation timing
+        "stream_options": {"include_usage": True},
+    }
+    
+    if no_cache:
+        payload["cache_prompt"] = False
+    
+    headers = {"Authorization": f"Bearer {api_key}"}
+    
+    return payload, headers
+
+
 async def run_benchmark(session, base_url, api_key, model_name, context_text, prompt_text, expected_pp_tokens, tg, no_cache, latency, post_run_cmd, tokenizer, args):
+    """
+    Orchestrates a single benchmark run by coordinating extracted functions.
+    
+    This refactored function follows the Single Responsibility Principle by acting
+    as a coordinator for the various aspects of benchmark execution.
+    
+    Args:
+        session: aiohttp ClientSession for HTTP requests
+        base_url: Base URL for the API endpoint
+        api_key: API key for authentication
+        model_name: Name of the model to benchmark
+        context_text: System context message
+        prompt_text: User prompt message
+        expected_pp_tokens: Expected prompt processing tokens
+        tg: Target generation tokens
+        no_cache: Whether to disable caching
+        latency: Measured latency
+        post_run_cmd: Command to execute after benchmark
+        tokenizer: Tokenizer instance for token counting
+        args: Arguments object containing configuration
+        
+    Returns:
+        dict: Performance metrics or None if an error occurred
+    """
+    # Step 1: Prepare messages
     messages = []
     if context_text:
         messages.append({"role": "system", "content": context_text})
     messages.append({"role": "user", "content": prompt_text})
     
-    ttft = 0
-    e2e_ttft = 0
-    token_count = 0
-    first_token_time = 0
-    first_response_time = 0
-    prompt_usage_tokens = 0
-    
+    # Initialize result structure
     result = {
         "pp_speed": None,
         "tg_speed": None,
@@ -333,21 +577,8 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
     }
 
     try:
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "max_tokens": tg,
-            "stream": True,  # Enable streaming for accurate token generation timing
-            "stream_options": {"include_usage": True},
-            # "temperature": 0,
-            # "seed": 42
-        }
-        
-        if no_cache:
-            payload["cache_prompt"] = False
-        
-        headers = {"Authorization": f"Bearer {api_key}"}
-        
+        # Step 2: Setup and send request
+        payload, headers = setup_benchmark_payload(model_name, messages, tg, no_cache, api_key)
         start_time = time.perf_counter()
 
         async with session.post(f"{base_url}/chat/completions", json=payload, headers=headers) as response:
@@ -356,141 +587,19 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
                 print(f"Error: {response.status} - {error_text}")
                 return None
             
-            # Parse streaming response
-            accumulated_content = ""
-            accumulated_reasoning_content = ""
-            token_count = 0
-            first_token_time = 0
-            first_response_time = 0
-            end_time = 0
-            has_first_token_been_tracked = False
-            
-            async for line in response.content:
-                line = line.decode('utf-8').strip()
-                if not line:
-                    continue
-                    
-                if line.startswith('data: '):
-                    data_str = line[6:]  # Remove 'data: ' prefix
-                    if data_str.strip() == '[DONE]':
-                        break
-                        
-                    try:
-                        data = json.loads(data_str)
-                        
-                        # Track first response time
-                        if first_response_time == 0:
-                            first_response_time = time.perf_counter()
-                            if args.debug_info:
-                                print(f"DEBUG: First response received at {first_response_time:.3f}s")
-                        
-                        # Extract content
-                        if 'choices' in data and len(data['choices']) > 0:
-                            choice = data['choices'][0]
-                            
-                            # Handle regular content
-                            if 'delta' in choice and 'content' in choice['delta']:
-                                content_chunk = choice['delta']['content']
-                                if content_chunk:
-                                    accumulated_content += content_chunk
-                                    
-                                    # Use helper function to track token metrics
-                                    chunk_tokens, first_token_time, has_first_token_been_tracked = track_token_metrics(
-                                        content_chunk, tokenizer, first_token_time, has_first_token_been_tracked, args.debug_info
-                                    )
-                                    token_count += chunk_tokens
-                            
-                            # Handle reasoning content
-                            if 'delta' in choice and 'reasoning_content' in choice['delta']:
-                                reasoning_chunk = choice['delta']['reasoning_content']
-                                if reasoning_chunk:
-                                    accumulated_reasoning_content += reasoning_chunk
-                                    
-                                    # Use helper function to track token metrics
-                                    chunk_tokens, first_token_time, has_first_token_been_tracked = track_token_metrics(
-                                        reasoning_chunk, tokenizer, first_token_time, has_first_token_been_tracked, args.debug_info
-                                    )
-                                    token_count += chunk_tokens
-                            
-                            # Extract usage information if present in this chunk
-                            if 'usage' in data:
-                                usage_data = data['usage']
-                                if 'prompt_tokens' in usage_data:
-                                    prompt_usage_tokens = usage_data['prompt_tokens']
-                                
-                    except json.JSONDecodeError as e:
-                        if args.debug_info:
-                            print(f"DEBUG: JSON decode error in streaming: {e}")
-                            print(f"DEBUG: Line content: {repr(line)}")
-                        continue
-                        
-            end_time = time.perf_counter()
-            if args.debug_info:
-                print(f"DEBUG: Final token_count: {token_count}, end_time: {end_time:.3f}s")
-                print(f"DEBUG: Accumulated content: {repr(accumulated_content[:100] if accumulated_content else None)}...")
-                print(f"DEBUG: Accumulated reasoning_content: {repr(accumulated_reasoning_content[:100] if accumulated_reasoning_content else None)}...")
-            
-            # Extract usage information from the streaming response
-            # We need to capture usage data from chunks that contain it
-            # Note: Usage data extraction is now integrated into the streaming loop above
-            # (added at lines 415-419 within the streaming processing)
+            # Step 3: Parse streaming response
+            accumulated_content, accumulated_reasoning_content, token_count, prompt_usage_tokens, first_token_time, has_first_token_been_tracked = await parse_streaming_response(
+                response.content, tokenizer, args
+            )
         
+        # Step 4: Calculate performance metrics
         if token_count > 0:
-            # Calculate TTFT and E2E TTFT
-            e2e_ttft = first_token_time - start_time if first_token_time > 0 else 0
-            ttft = e2e_ttft - latency if e2e_ttft > 0 else 0
-            if ttft < 0:
-                ttft = 0
-                
-            # Calculate token generation speed (for streaming mode)
-            if first_token_time > 0 and end_time > first_token_time:
-                # Generation time = total time - first token time
-                generation_time = end_time - first_token_time
-                if generation_time > 0:
-                    # Speed for generated tokens (excluding the first one which is TTFT)
-                    result["tg_speed"] = (token_count - 1) / generation_time if token_count > 1 else token_count / generation_time
-                else:
-                    # Fallback if generation time is too small
-                    result["tg_speed"] = (token_count - 1) / 0.001 if token_count > 1 else token_count / 0.001
-            else:
-                # Fallback for non-streaming or edge cases
-                total_request_time = end_time - start_time
-                if total_request_time > 0:
-                    result["tg_speed"] = token_count / total_request_time
-                else:
-                    result["tg_speed"] = token_count / 0.001  # Assume 1ms minimum
-            
-            # Use expected_pp_tokens for speed calculation
-            total_prompt_tokens = expected_pp_tokens
-            
-            # Only use reported usage if it's close to expected (to handle tokenizer differences)
-            # but not if it's vastly different (which happens in prefix caching where usage includes cached tokens)
-            if prompt_usage_tokens > 0:
-                diff = abs(prompt_usage_tokens - expected_pp_tokens)
-                if diff < expected_pp_tokens * 0.2: # 20% tolerance
-                     total_prompt_tokens = prompt_usage_tokens
-
-            # Calculate TTFT (time to first token) and Estimated Prompt Processing Time
-            ttfr = 0
-            est_ppt = 0
-            if first_token_time > 0:
-                ttfr = first_token_time - start_time
-                est_ppt = ttfr - latency
-                if est_ppt < 0:
-                    est_ppt = 0
-
-            if est_ppt > 0:
-                result["pp_speed"] = total_prompt_tokens / est_ppt
-                result["est_ppt"] = est_ppt
-
-            if ttfr > 0:
-                result["ttfr"] = ttfr
-
-            if ttft > 0:
-                result["ttft"] = ttft
-
-            if e2e_ttft > 0:
-                result["e2e_ttft"] = e2e_ttft
+            # Get end time from the last response processing
+            end_time = time.perf_counter()
+            result.update(calculate_performance_metrics(
+                start_time, first_token_time, end_time, token_count,
+                prompt_usage_tokens, expected_pp_tokens, latency, args
+            ))
 
     except Exception as e:
         print(f"Error during run: {e}")
@@ -498,12 +607,8 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
         traceback.print_exc()
         return None
     
-    if post_run_cmd:
-        try:
-            # Fix: Avoid shell=True to prevent command injection
-            subprocess.run(post_run_cmd.split(), check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Post-run command failed: {e}")
+    # Step 5: Execute post-run command
+    execute_post_run_command(post_run_cmd)
 
     return result
 
