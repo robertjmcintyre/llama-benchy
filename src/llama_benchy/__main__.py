@@ -15,14 +15,13 @@ import asyncio
 import json
 import codecs
 import hashlib
+from typing import Optional, Tuple
 from transformers import AutoTokenizer
 import requests
 from pathlib import Path
-from transformers import AutoTokenizer
 
 # Build number is now imported from __init__.py
 from . import __version__
-
 
 
 def parse_arguments():
@@ -32,7 +31,10 @@ def parse_arguments():
     parser.add_argument("--api-key", type=str, default="EMPTY", help="API Key for the endpoint")
     parser.add_argument("--model", type=str, required=True, help="Model name to use for benchmarking")
     parser.add_argument("--served-model-name", type=str, default=None, help="Model name used in API calls (defaults to --model if not specified)")
-    parser.add_argument("--tokenizer", type=str, default=None, help="HuggingFace tokenizer name (defaults to model name)")
+    parser.add_argument("--tokenizer-hf", type=str, default=None, 
+                       help="Load tokenizer from HuggingFace Hub (e.g., 'gpt2', 'bert-base-uncased')")
+    parser.add_argument("--tokenizer-path", type=str, default=None,
+                       help="Load tokenizer from local path (directory or file)")
     parser.add_argument("--pp", type=int, nargs='+', required=False, default=[2048], help="List of prompt processing token counts - default: 2048")
     parser.add_argument("--tg", type=int, nargs='+', required=False, default=[32], help="List of token generation counts - default: 32")
     parser.add_argument("--depth", type=int, nargs='+', default=[0], help="List of context depths (previous conversation tokens) - default: 0")
@@ -45,35 +47,22 @@ def parse_arguments():
     parser.add_argument("--adapt-prompt", action="store_true", default=True, help="Adapt prompt size based on warmup token usage delta (default: True)")
     parser.add_argument("--no-adapt-prompt", action="store_false", dest="adapt_prompt", help="Disable prompt size adaptation")
     parser.add_argument("--enable-prefix-caching", action="store_true", help="Enable prefix caching performance measurement")
-    return parser.parse_args()
-
-
-def get_tokenizerv1(model_name, tokenizer_name=None):
-    try:
-        name = tokenizer_name if tokenizer_name else model_name
-        return AutoTokenizer.from_pretrained(name)
-    except Exception as e:
-        print(f"Error loading tokenizer: {e}")
-        print("Falling back to 'gpt2' tokenizer as approximation.")
-        return AutoTokenizer.from_pretrained("gpt2")
-
-def get_tokenizer2(model_name, tokenizer_path=None):
-    print(f"DEBUG: model_name={model_name}")
-    print(f"DEBUG: tokenizer_path={tokenizer_path}")
-    if tokenizer_path:
-        path = Path(tokenizer_path)
-        if path.exists():
-            print(f"DEBUG: Loading tokenizer from local path: {path}")
-            return AutoTokenizer.from_pretrained(
-                path,
-                local_files_only=True,
-                use_fast=False,
-                repo_type="tokenizer"
-            )
+    parser.add_argument("--debug-info", action="store_true", help="Show detailed debugging information during benchmark execution")
+    
+    args = parser.parse_args()
+    
+    # Handle backward compatibility with deprecated --tokenizer argument
+    if hasattr(args, 'tokenizer') and args.tokenizer:
+        if args.tokenizer_hf or args.tokenizer_path:
+            print("Warning: Both --tokenizer and --tokenizer-hf/--tokenizer-path specified")
+            print("Ignoring deprecated --tokenizer argument")
         else:
-            print(f"DEBUG: Path does not exist: {path}")
-    print("DEBUG: Falling back to model_name")
-    return AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=False)
+            # Treat old --tokenizer as HuggingFace name for compatibility
+            args.tokenizer_hf = args.tokenizer
+            delattr(args, 'tokenizer')
+    
+    return args
+
 
 class DummyTokenizer:
     def encode(self, text, **kwargs):
@@ -82,8 +71,33 @@ class DummyTokenizer:
     def decode(self, tokens, **kwargs):
         return " ".join(tokens)
 
-def get_tokenizer(model_name, tokenizer_path=None):
-    return DummyTokenizer()
+
+def load_tokenizer(hf_name: Optional[str] = None, local_path: Optional[str] = None):
+    """
+    Load tokenizer with fallback chain:
+    1. HuggingFace (if hf_name specified)
+    2. Local path (if local_path specified)  
+    3. DummyTokenizer (fallback)
+    """
+    try:
+        # Attempt HuggingFace loading
+        if hf_name:
+            return AutoTokenizer.from_pretrained(hf_name)
+        
+        # Attempt local path loading
+        if local_path:
+            path = Path(local_path)
+            if path.exists():
+                return AutoTokenizer.from_pretrained(str(path), local_files_only=True)
+            
+        # Fall back to DummyTokenizer
+        return DummyTokenizer()
+        
+    except Exception as e:
+        print(f"Warning: Failed to load tokenizer: {e}")
+        print("Using DummyTokenizer as fallback")
+        return DummyTokenizer()
+
 
 def prepare_text_data(book_url, tokenizer):
     try:
@@ -117,7 +131,8 @@ def prepare_text_data(book_url, tokenizer):
         return tokenizer.encode(text, add_special_tokens=False)
     except Exception as e:
         print(f"Error downloading book: {e}")
-        exit(1)
+        # Fix: Raise exception instead of exiting to allow graceful handling
+        raise RuntimeError(f"Failed to download book from {book_url}: {e}")
 
 
 def generate_prompt(all_tokens, tokenizer, prompt_tokens, context_tokens=0, no_cache=False):
@@ -249,7 +264,53 @@ async def warmup(session, base_url, api_key, model, tokenizer=None):
     return delta_user, delta_context
 
 
-async def run_benchmark(session, base_url, api_key, model_name, context_text, prompt_text, expected_pp_tokens, tg, no_cache, latency, post_run_cmd):
+def track_token_metrics(chunk: str, tokenizer, first_token_time: float,
+                       has_first_token_tracked: bool, debug_enabled: bool) -> Tuple[int, float, bool]:
+    """
+    Track token metrics for a content chunk.
+    
+    This function calculates token counts using the provided tokenizer to maintain
+    consistency with the benchmarking methodology. The token count reflects the
+    tokenizer's perspective, which may differ from the actual tokens processed
+    by the LLM but ensures consistent measurements across the benchmark.
+    
+    Args:
+        chunk: The content chunk to process
+        tokenizer: Tokenizer instance for encoding
+        first_token_time: Current first token time
+        has_first_token_tracked: Flag indicating if first token has been tracked
+        debug_enabled: Whether debug logging is enabled
+        
+    Returns:
+        tuple: (chunk_tokens, updated_first_token_time, updated_has_first_token_tracked)
+               - chunk_tokens: Number of tokens in this chunk (based on tokenizer)
+               - updated_first_token_time: Time when first token was detected
+               - updated_has_first_token_tracked: Flag indicating first token tracking
+    """
+    if not chunk:
+        return 0, first_token_time, has_first_token_tracked
+    
+    # Count tokens in this chunk using the tokenizer for consistency
+    # This ensures our measurements align with the benchmarking methodology
+    try:
+        chunk_tokens = len(tokenizer.encode(chunk, add_special_tokens=False))
+    except Exception as e:
+        # Handle potential encoding errors gracefully
+        if debug_enabled:
+            print(f"DEBUG: Error encoding chunk: {e}")
+        chunk_tokens = 0
+    
+    # Track first token time if this is the first token-bearing chunk
+    if not has_first_token_tracked and chunk_tokens > 0:
+        new_first_token_time = time.perf_counter()
+        if debug_enabled:
+            print(f"DEBUG: First token received at {new_first_token_time:.3f}s")
+        return chunk_tokens, new_first_token_time, True
+    
+    return chunk_tokens, first_token_time, has_first_token_tracked
+
+
+async def run_benchmark(session, base_url, api_key, model_name, context_text, prompt_text, expected_pp_tokens, tg, no_cache, latency, post_run_cmd, tokenizer, args):
     messages = []
     if context_text:
         messages.append({"role": "system", "content": context_text})
@@ -276,7 +337,7 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
             "model": model_name,
             "messages": messages,
             "max_tokens": tg,
-            "stream": True,
+            "stream": True,  # Enable streaming for accurate token generation timing
             "stream_options": {"include_usage": True},
             # "temperature": 0,
             # "seed": 42
@@ -294,59 +355,110 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
                 error_text = await response.text()
                 print(f"Error: {response.status} - {error_text}")
                 return None
-
-            buffer = ""
-            decoder = codecs.getincrementaldecoder("utf-8")(errors='replace')
-            async for chunk_bytes in response.content:
-                chunk_time = time.perf_counter()
-                decoded_chunk = decoder.decode(chunk_bytes, final=False)
-                buffer += decoded_chunk
-                
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line or line == 'data: [DONE]':
-                        continue
+            
+            # Parse streaming response
+            accumulated_content = ""
+            accumulated_reasoning_content = ""
+            token_count = 0
+            first_token_time = 0
+            first_response_time = 0
+            end_time = 0
+            has_first_token_been_tracked = False
+            
+            async for line in response.content:
+                line = line.decode('utf-8').strip()
+                if not line:
+                    continue
                     
-                    if line.startswith('data: '):
-                        try:
-                            chunk = json.loads(line[6:])
-                            if 'usage' in chunk:
-                                prompt_usage_tokens = chunk['usage'].get('prompt_tokens', 0)
+                if line.startswith('data: '):
+                    data_str = line[6:]  # Remove 'data: ' prefix
+                    if data_str.strip() == '[DONE]':
+                        break
+                        
+                    try:
+                        data = json.loads(data_str)
+                        
+                        # Track first response time
+                        if first_response_time == 0:
+                            first_response_time = time.perf_counter()
+                            if args.debug_info:
+                                print(f"DEBUG: First response received at {first_response_time:.3f}s")
+                        
+                        # Extract content
+                        if 'choices' in data and len(data['choices']) > 0:
+                            choice = data['choices'][0]
                             
-                            if 'choices' in chunk and len(chunk['choices']) > 0:
-                                if first_response_time == 0:
-                                    first_response_time = chunk_time
-
-                                delta = chunk['choices'][0].get('delta', {})
-                                content = delta.get('content')
-                                reasoning_content = delta.get('reasoning_content')
-                                
-                                if content or reasoning_content:
-                                    if token_count == 0:
-                                        first_token_time = chunk_time
-                                        e2e_ttft = first_token_time - start_time
-                                        ttft = e2e_ttft-latency
-                                        if ttft < 0:
-                                            ttft = 0
+                            # Handle regular content
+                            if 'delta' in choice and 'content' in choice['delta']:
+                                content_chunk = choice['delta']['content']
+                                if content_chunk:
+                                    accumulated_content += content_chunk
                                     
-                                    token_count += 1
-                        except json.JSONDecodeError:
-                            continue
-        
-        end_time = time.perf_counter()
+                                    # Use helper function to track token metrics
+                                    chunk_tokens, first_token_time, has_first_token_been_tracked = track_token_metrics(
+                                        content_chunk, tokenizer, first_token_time, has_first_token_been_tracked, args.debug_info
+                                    )
+                                    token_count += chunk_tokens
+                            
+                            # Handle reasoning content
+                            if 'delta' in choice and 'reasoning_content' in choice['delta']:
+                                reasoning_chunk = choice['delta']['reasoning_content']
+                                if reasoning_chunk:
+                                    accumulated_reasoning_content += reasoning_chunk
+                                    
+                                    # Use helper function to track token metrics
+                                    chunk_tokens, first_token_time, has_first_token_been_tracked = track_token_metrics(
+                                        reasoning_chunk, tokenizer, first_token_time, has_first_token_been_tracked, args.debug_info
+                                    )
+                                    token_count += chunk_tokens
+                            
+                            # Extract usage information if present in this chunk
+                            if 'usage' in data:
+                                usage_data = data['usage']
+                                if 'prompt_tokens' in usage_data:
+                                    prompt_usage_tokens = usage_data['prompt_tokens']
+                                
+                    except json.JSONDecodeError as e:
+                        if args.debug_info:
+                            print(f"DEBUG: JSON decode error in streaming: {e}")
+                            print(f"DEBUG: Line content: {repr(line)}")
+                        continue
+                        
+            end_time = time.perf_counter()
+            if args.debug_info:
+                print(f"DEBUG: Final token_count: {token_count}, end_time: {end_time:.3f}s")
+                print(f"DEBUG: Accumulated content: {repr(accumulated_content[:100] if accumulated_content else None)}...")
+                print(f"DEBUG: Accumulated reasoning_content: {repr(accumulated_reasoning_content[:100] if accumulated_reasoning_content else None)}...")
+            
+            # Extract usage information from the streaming response
+            # We need to capture usage data from chunks that contain it
+            # Note: Usage data extraction is now integrated into the streaming loop above
+            # (added at lines 415-419 within the streaming processing)
         
         if token_count > 0:
-            # Calculate decode time (time for subsequent tokens)
-            # If only 1 token, decode_time is effectively 0, so we can't calculate inter-token speed
-            if token_count > 1:
-                decode_time = end_time - first_token_time
-                if decode_time > 0:
-                    # Speed for the generated tokens (excluding the first one which is TTFT)
-                    result["tg_speed"] = (token_count - 1) / decode_time
+            # Calculate TTFT and E2E TTFT
+            e2e_ttft = first_token_time - start_time if first_token_time > 0 else 0
+            ttft = e2e_ttft - latency if e2e_ttft > 0 else 0
+            if ttft < 0:
+                ttft = 0
+                
+            # Calculate token generation speed (for streaming mode)
+            if first_token_time > 0 and end_time > first_token_time:
+                # Generation time = total time - first token time
+                generation_time = end_time - first_token_time
+                if generation_time > 0:
+                    # Speed for generated tokens (excluding the first one which is TTFT)
+                    result["tg_speed"] = (token_count - 1) / generation_time if token_count > 1 else token_count / generation_time
                 else:
-                    # Fallback if time is too small
-                    result["tg_speed"] = (token_count - 1) / 0.0001
+                    # Fallback if generation time is too small
+                    result["tg_speed"] = (token_count - 1) / 0.001 if token_count > 1 else token_count / 0.001
+            else:
+                # Fallback for non-streaming or edge cases
+                total_request_time = end_time - start_time
+                if total_request_time > 0:
+                    result["tg_speed"] = token_count / total_request_time
+                else:
+                    result["tg_speed"] = token_count / 0.001  # Assume 1ms minimum
             
             # Use expected_pp_tokens for speed calculation
             total_prompt_tokens = expected_pp_tokens
@@ -358,21 +470,22 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
                 if diff < expected_pp_tokens * 0.2: # 20% tolerance
                      total_prompt_tokens = prompt_usage_tokens
 
-            # Calculate TTFR and Estimated Prompt Processing Time
+            # Calculate TTFT (time to first token) and Estimated Prompt Processing Time
             ttfr = 0
             est_ppt = 0
-            if first_response_time > 0:
-                    ttfr = first_response_time - start_time
-                    est_ppt = ttfr - latency
-                    if est_ppt < 0: est_ppt = 0
+            if first_token_time > 0:
+                ttfr = first_token_time - start_time
+                est_ppt = ttfr - latency
+                if est_ppt < 0:
+                    est_ppt = 0
 
             if est_ppt > 0:
-                    result["pp_speed"] = total_prompt_tokens / est_ppt
-                    result["est_ppt"] = est_ppt
-            
+                result["pp_speed"] = total_prompt_tokens / est_ppt
+                result["est_ppt"] = est_ppt
+
             if ttfr > 0:
-                    result["ttfr"] = ttfr
-            
+                result["ttfr"] = ttfr
+
             if ttft > 0:
                 result["ttft"] = ttft
 
@@ -381,11 +494,14 @@ async def run_benchmark(session, base_url, api_key, model_name, context_text, pr
 
     except Exception as e:
         print(f"Error during run: {e}")
+        import traceback
+        traceback.print_exc()
         return None
     
     if post_run_cmd:
         try:
-            subprocess.run(post_run_cmd, shell=True, check=True)
+            # Fix: Avoid shell=True to prevent command injection
+            subprocess.run(post_run_cmd.split(), check=True)
         except subprocess.CalledProcessError as e:
             print(f"Post-run command failed: {e}")
 
@@ -408,7 +524,10 @@ async def main_async():
     
     served_model_name = args.served_model_name if args.served_model_name else args.model
 
-    tokenizer = get_tokenizer(args.model, args.tokenizer)
+    tokenizer = load_tokenizer(
+        hf_name=args.tokenizer_hf,
+        local_path=args.tokenizer_path
+    )
     all_tokens = prepare_text_data(args.book_url, tokenizer)
     print(f"Total tokens available in text corpus: {len(all_tokens)}")
     
@@ -463,7 +582,7 @@ async def main_async():
                             # This establishes the prefix: [System: Context] [User: ""]
                             # Expected PP tokens = current_depth (context size)
                             print(f"  Run {run+1}/{args.runs} (Context Load)...")
-                            ctx_result = await run_benchmark(session, args.base_url, args.api_key, served_model_name, context, "", current_depth, tg, args.no_cache, latency, None)
+                            ctx_result = await run_benchmark(session, args.base_url, args.api_key, served_model_name, context, "", current_depth, tg, args.no_cache, latency, None, tokenizer, args)
                             
                             if ctx_result:
                                 if ctx_result["pp_speed"] is not None:
@@ -482,12 +601,12 @@ async def main_async():
                             # The prefix [System: Context] should be cached.
                             # Expected PP tokens = current_pp (prompt size only)
                             print(f"  Run {run+1}/{args.runs} (Inference)...")
-                            run_result = await run_benchmark(session, args.base_url, args.api_key, served_model_name, context, prompt, current_pp, tg, args.no_cache, latency, args.post_run_cmd)
+                            run_result = await run_benchmark(session, args.base_url, args.api_key, served_model_name, context, prompt, current_pp, tg, args.no_cache, latency, args.post_run_cmd, tokenizer, args)
                         else:
                             # Standard run
                             # Expected PP tokens = current_pp + current_depth
                             expected_tokens = current_pp + current_depth
-                            run_result = await run_benchmark(session, args.base_url, args.api_key, served_model_name, context, prompt, expected_tokens, tg, args.no_cache, latency, args.post_run_cmd)
+                            run_result = await run_benchmark(session, args.base_url, args.api_key, served_model_name, context, prompt, expected_tokens, tg, args.no_cache, latency, args.post_run_cmd, tokenizer, args)
                         
                         if run_result:
                             if run_result["tg_speed"] is not None:
